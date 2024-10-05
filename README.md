@@ -313,4 +313,393 @@ for(int i = 2000; i >= 0; i -= 200){
     SysTick_DelayTicks(i);
     GPIO_PortToggle(BOARD_LED_GPIO, 1u << BOARD_LED_GPIO_PIN);
 	}
+
 ```
+
+# Proyecto PWM
+# Entregable 1: Diagrama de Estados
+![Diagrama sin título drawio](https://github.com/user-attachments/assets/eb17d8ac-1b08-4c88-8b77-5b3b89a75767)
+
+# Entregable 2: Código Fuente
+```c
+/*
+ * Todos los derechos reservados.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "fsl_debug_console.h"
+#include "board.h"
+#include "fsl_ftm.h"
+#include "pin_mux.h"
+#include "clock_config.h"
+#include "fsl_gpio.h"
+
+/*******************************************************************************
+ * Definiciones
+ ******************************************************************************/
+/* Dirección base y canal del FlexTimer utilizados */
+#define BOARD_FTM_BASEADDR FTM3
+#define BOARD_FTM_CHANNEL  kFTM_Chnl_4
+
+/* Número de interrupción y manejador de interrupción para el FTM utilizado */
+#define FTM_INTERRUPT_NUMBER FTM3_IRQn
+#define FTM_LED_HANDLER      FTM3_IRQHandler
+
+/* Interrupción a habilitar y bandera a leer */
+#define FTM_CHANNEL_INTERRUPT_ENABLE kFTM_Chnl4InterruptEnable
+#define FTM_CHANNEL_FLAG             kFTM_Chnl4Flag
+
+/* Obtener fuente de reloj para el controlador FTM */
+#define FTM_SOURCE_CLOCK CLOCK_GetFreq(kCLOCK_CoreSysClk)
+
+/* Definiciones para el teclado matricial */
+#define NUM_ROWS 4U
+#define NUM_COLS 4U
+
+/* Macro para verificar si una tecla es numérica */
+#define is_number_key(key) ((key) >= '0' && (key) <= '9')
+
+/*******************************************************************************
+ * Prototipos
+ ******************************************************************************/
+void delay(void);
+void activate_pwm(void);
+void deactivate_pwm(void);
+void update_duty_cycle(uint8_t update_value);
+void state_idle_function(void);
+void state_pwm_function(void);
+void state_duty_cycle_entry_function(void);
+void state_machine_init(void);
+char scan_keypad(void);
+
+/*******************************************************************************
+ * Variables
+ ******************************************************************************/
+/* Variables globales y volátiles */
+volatile bool ftmIsrFlag          = false;
+volatile uint8_t updatedDutycycle = 10U;
+
+/* Configuraciones para FTM */
+ftm_config_t ftmInfo;
+ftm_chnl_pwm_signal_param_t ftmParam;
+ftm_pwm_level_select_t pwmLevel = kFTM_LowTrue;
+
+/* Definición de estados para la máquina de estados */
+typedef enum {
+    STATE_IDLE = 0,
+    STATE_PWM_ACTIVE,
+    STATE_DUTY_CYCLE_ENTRY
+} State;
+
+State current_state;
+
+/* Tabla de funciones de estado */
+static void (*state_table[])(void) = {
+    state_idle_function,
+    state_pwm_function,
+    state_duty_cycle_entry_function
+};
+
+/* Variables para la entrada del ciclo de trabajo */
+char duty_cycle_input[3] = {0}; /* Almacena hasta dos dígitos y terminador nulo */
+uint8_t input_index;
+volatile uint8_t duty_cycle_value = 0;
+
+/* Variables para el teclado matricial */
+char key;
+const char key_map[NUM_ROWS][NUM_COLS] = {
+    {'1', '2', '3', 'A'},
+    {'4', '5', '6', 'B'},
+    {'7', '8', '9', 'C'},
+    {'*', '0', '#', 'D'}
+};
+
+const uint8_t row_pins[NUM_ROWS] = {12U, 13U, 14U, 15U}; /* Pines de las filas */
+const uint8_t col_pins[NUM_COLS] = {11U, 12U, 13U, 14U}; /* Pines de las columnas */
+
+/*******************************************************************************
+ * Código
+ ******************************************************************************/
+
+/*!
+ * @brief Función principal
+ */
+int main(void)
+{
+    /* Inicialización de pines, reloj y consola de depuración */
+    BOARD_InitPins();
+    BOARD_BootClockRUN();
+    BOARD_InitDebugConsole();
+
+    /* Inicialización de la máquina de estados */
+    state_machine_init();
+
+    /* Bucle principal */
+    while (1) {
+        /* Escaneo del teclado matricial */
+        key = scan_keypad();
+        /* Ejecución de la función correspondiente al estado actual */
+        state_table[current_state]();
+    }
+
+    return 0;
+}
+
+/*!
+ * @brief Activar PWM con el ciclo de trabajo actual
+ */
+void activate_pwm(void) {
+    /* Configurar parámetros de FTM con frecuencia de 24 kHz */
+    ftmParam.chnlNumber            = BOARD_FTM_CHANNEL;
+    ftmParam.level                 = pwmLevel;
+    ftmParam.dutyCyclePercent      = duty_cycle_value;
+    ftmParam.firstEdgeDelayPercent = 0U;
+    ftmParam.enableDeadtime        = false;
+
+    /* Obtener configuración por defecto de FTM */
+    FTM_GetDefaultConfig(&ftmInfo);
+    /* Inicializar módulo FTM */
+    FTM_Init(BOARD_FTM_BASEADDR, &ftmInfo);
+
+    /* Configurar PWM de FTM */
+    FTM_SetupPwm(BOARD_FTM_BASEADDR, &ftmParam, 1U, kFTM_CenterAlignedPwm, 24000U, FTM_SOURCE_CLOCK);
+
+    /* Iniciar temporizador FTM */
+    FTM_StartTimer(BOARD_FTM_BASEADDR, kFTM_SystemClock);
+}
+
+/*!
+ * @brief Desactivar PWM
+ */
+void deactivate_pwm(void) {
+    /* Actualizar selección de nivel de borde del canal para desactivar la salida */
+    FTM_UpdateChnlEdgeLevelSelect(BOARD_FTM_BASEADDR, BOARD_FTM_CHANNEL, 0U);
+}
+
+/*!
+ * @brief Actualizar el ciclo de trabajo del PWM
+ *
+ * @param update_value Nuevo valor de ciclo de trabajo (0-100)
+ */
+void update_duty_cycle(uint8_t update_value) {
+    /* Deshabilitar salida del canal antes de actualizar el ciclo de trabajo */
+    FTM_UpdateChnlEdgeLevelSelect(BOARD_FTM_BASEADDR, BOARD_FTM_CHANNEL, 0U);
+
+    /* Actualizar ciclo de trabajo del PWM */
+    FTM_UpdatePwmDutycycle(BOARD_FTM_BASEADDR, BOARD_FTM_CHANNEL, kFTM_CenterAlignedPwm, update_value);
+
+    /* Disparar software para actualizar registros */
+    FTM_SetSoftwareTrigger(BOARD_FTM_BASEADDR, true);
+
+    /* Iniciar salida del canal con ciclo de trabajo actualizado */
+    FTM_UpdateChnlEdgeLevelSelect(BOARD_FTM_BASEADDR, BOARD_FTM_CHANNEL, pwmLevel);
+
+    /* Pequeña demora para ver el ciclo de trabajo actualizado */
+    delay();
+}
+
+/*!
+ * @brief Función de demora
+ */
+void delay(void)
+{
+    volatile uint32_t i = 0U;
+    for (i = 0U; i < 8000U; ++i)
+    {
+        __asm("NOP"); /* No operación para demora */
+    }
+}
+
+/*!
+ * @brief Inicializar la máquina de estados
+ */
+void state_machine_init(void) {
+    current_state = STATE_IDLE;
+    input_index = 0;
+}
+
+/*!
+ * @brief Función del estado IDLE
+ */
+void state_idle_function(void) {
+    if (key == 'A') {
+        activate_pwm();
+        current_state = STATE_PWM_ACTIVE;
+    }
+    else {
+        /* Reiniciar entrada de ciclo de trabajo en cualquier otra tecla */
+        memset(duty_cycle_input, 0, sizeof(duty_cycle_input));
+    }
+}
+
+/*!
+ * @brief Función del estado PWM ACTIVE
+ */
+void state_pwm_function(void) {
+    if (key == 'B') {
+        deactivate_pwm();
+        duty_cycle_value = 0;
+        current_state = STATE_IDLE;
+    } else if (is_number_key(key)) {
+        /* Iniciar entrada de ciclo de trabajo */
+        duty_cycle_input[0] = key;
+        input_index = 1;
+        current_state = STATE_DUTY_CYCLE_ENTRY;
+    }
+}
+
+/*!
+ * @brief Función del estado DUTY CYCLE ENTRY
+ */
+void state_duty_cycle_entry_function(void) {
+    if (is_number_key(key) && input_index < 2) {
+        /* Almacenar dígito ingresado */
+        duty_cycle_input[input_index++] = key;
+    } else if (key == 'D') {
+        /* Convertir entrada a entero y actualizar ciclo de trabajo */
+        duty_cycle_input[input_index] = '\0';
+        duty_cycle_value = atoi(duty_cycle_input);
+        if (duty_cycle_value >= 0 && duty_cycle_value <= 100) {
+            update_duty_cycle(duty_cycle_value);
+        }
+        /* Reiniciar entrada */
+        input_index = 0;
+        memset(duty_cycle_input, 0, sizeof(duty_cycle_input));
+        current_state = STATE_PWM_ACTIVE;
+    } else if (key == 'C') {
+        /* Cancelar entrada y regresar al estado PWM ACTIVE */
+        input_index = 0;
+        memset(duty_cycle_input, 0, sizeof(duty_cycle_input));
+        current_state = STATE_PWM_ACTIVE;
+    }
+}
+
+/*!
+ * @brief Escaneo del teclado matricial
+ *
+ * @return Carácter de la tecla presionada, 'Z' si ninguna tecla es presionada
+ */
+char scan_keypad(void) {
+    for (uint8_t row = 0; row < NUM_ROWS; row++)
+    {
+        /* Establecer todas las filas en alto */
+        for (uint8_t i = 0; i < NUM_ROWS; i++)
+        {
+            GPIO_PinWrite(GPIOB, row_pins[i], 1U);
+        }
+
+        /* Establecer la fila actual en bajo */
+        GPIO_PinWrite(GPIOB, row_pins[row], 0U);
+
+        /* Pequeña demora para estabilización de señal */
+        SDK_DelayAtLeastUs(5U, CLOCK_GetFreq(kCLOCK_CoreSysClk));
+
+        /* Leer columnas */
+        for (uint8_t col = 0; col < NUM_COLS; col++)
+        {
+            if (!GPIO_PinRead(GPIOA, col_pins[col]))
+            {
+                /* Tecla presionada */
+                /* Demora para anti-rebote */
+                SDK_DelayAtLeastUs(20U, CLOCK_GetFreq(kCLOCK_CoreSysClk));
+
+                /* Verificar que la tecla sigue presionada */
+                if (!GPIO_PinRead(GPIOA, col_pins[col]))
+                {
+                    /* Esperar hasta que la tecla sea liberada */
+                    while (!GPIO_PinRead(GPIOA, col_pins[col]))
+                    {
+                        /* Pequeña demora para evitar bloqueo de CPU */
+                        SDK_DelayAtLeastUs(5U, CLOCK_GetFreq(kCLOCK_CoreSysClk));
+                    }
+
+                    /* Retornar valor de la tecla */
+                    return key_map[row][col];
+                }
+            }
+        }
+    }
+
+    /* Ninguna tecla presionada */
+    return 'Z';
+}
+```
+
+# Entregable 3: Explicación del Código
+## Descripción General
+
+El programa controla la intensidad de un LED mediante la variación del ciclo de trabajo de una señal PWM. El usuario puede interactuar con el sistema utilizando un teclado matricial para:
+
+- **Estado IDLE (Reposo)**: El sistema espera a que el usuario presione la tecla 'A' para activar el PWM.
+- **Estado PWM ACTIVE (PWM Activo)**: El PWM está activo, y el usuario puede ingresar un nuevo ciclo de trabajo o desactivar el PWM presionando 'B'.
+- **Estado DUTY CYCLE ENTRY (Entrada de Ciclo de Trabajo)**: El usuario ingresa un valor numérico (0-99) seguido de 'D' para actualizar el ciclo de trabajo, o 'C' para cancelar.
+
+## Implementación de la Máquina de Estados
+
+La máquina de estados se implementa utilizando:
+
+- **Enum State**: Define los posibles estados del sistema (`STATE_IDLE`, `STATE_PWM_ACTIVE`, `STATE_DUTY_CYCLE_ENTRY`).
+- **Variable `current_state`**: Almacena el estado actual de la máquina de estados.
+- **Tabla de funciones `state_table`**: Arreglo de punteros a funciones que corresponden a cada estado.
+
+En el bucle principal, el programa:
+
+1. Escanea el teclado matricial y almacena la tecla presionada en `key`.
+2. Llama a la función correspondiente al estado actual desde `state_table[current_state]()`.
+3. Las funciones de estado manejan las transiciones y acciones basadas en la entrada.
+
+## Lectura del Teclado Matricial
+
+La función `scan_keypad()` realiza el escaneo del teclado:
+
+- Configura todas las filas en alto.
+- Para cada fila:
+  - Establece la fila actual en bajo.
+  - Lee cada columna para detectar si una tecla está presionada.
+  - Implementa una demora para el anti-rebote.
+  - Verifica si la tecla sigue presionada y espera hasta que sea liberada.
+- Retorna el carácter correspondiente desde `key_map`.
+
+## Control del PWM
+
+Las funciones relacionadas con el control del PWM son:
+
+- **`activate_pwm()`**: Configura y activa el PWM con el ciclo de trabajo actual (`duty_cycle_value`).
+- **`deactivate_pwm()`**: Desactiva el PWM.
+- **`update_duty_cycle(uint8_t update_value)`**: Actualiza el ciclo de trabajo del PWM al nuevo valor proporcionado.
+
+Estas funciones utilizan las APIs del FlexTimer Module (FTM) para configurar y controlar la señal PWM.
+
+## Descripción de las Funciones Principales
+
+- **`main()`**: Inicializa el sistema y entra en un bucle infinito donde se escanea el teclado y se ejecuta la función del estado actual.
+- **`state_machine_init()`**: Inicializa la máquina de estados estableciendo el estado inicial y reseteando índices.
+- **`state_idle_function()`**: Maneja el estado IDLE; activa el PWM si se presiona 'A'.
+- **`state_pwm_function()`**: Maneja el estado PWM ACTIVE; desactiva el PWM si se presiona 'B' o inicia la entrada de ciclo de trabajo si se presiona una tecla numérica.
+- **`state_duty_cycle_entry_function()`**: Maneja la entrada del ciclo de trabajo; permite ingresar hasta dos dígitos y actualiza el ciclo de trabajo al presionar 'D'.
+
+## Manejo de Entradas del Usuario
+
+- **Entrada Numérica**: Se verifica con la macro `is_number_key(key)`. Los dígitos ingresados se almacenan en `duty_cycle_input`.
+- **Confirmación y Cancelación**:
+  - **Confirmar ('D')**: Convierte la entrada a entero y actualiza el ciclo de trabajo.
+  - **Cancelar ('C')**: Reinicia la entrada y regresa al estado anterior.
+
+## Demoras y Anti-rebote
+
+Se utilizan funciones de demora como `delay()` y `SDK_DelayAtLeastUs()` para:
+
+- Estabilizar señales durante el escaneo del teclado.
+- Implementar anti-rebote al leer las teclas.
+- Proporcionar demoras necesarias al actualizar el PWM.
+
+## Configuración del Hardware
+
+- **Pines del Teclado Matricial**:
+  - **Filas (`row_pins`)**: Pines configurados como salidas para seleccionar la fila.
+  - **Columnas (`col_pins`)**: Pines configurados como entradas para leer el estado de las columnas.
+
+- **PWM**:
+  - **FTM (FlexTimer Module)**: Utilizado para generar la señal PWM.
+  - **Canal y Nivel**: Configurados mediante `ftmParam`.
