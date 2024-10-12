@@ -703,3 +703,6 @@ Se utilizan funciones de demora como `delay()` y `SDK_DelayAtLeastUs()` para:
 - **PWM**:
   - **FTM (FlexTimer Module)**: Utilizado para generar la señal PWM.
   - **Canal y Nivel**: Configurados mediante `ftmParam`.
+
+# Evidencia del Funcionamiento
+En el repositorio se encuentra un archivo mp4 que muestra el funcionamiento del sistema.
